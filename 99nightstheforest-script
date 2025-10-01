@@ -1,0 +1,584 @@
+print("Kit de Testes de Segurança — 99 Nights ambiente controlado")
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+
+-- CONFIG --------------------------------------------------
+local MAX_DISTANCE_DEFAULT = 150 -- distância máxima aceitada (ajuste conforme seu mapa)
+local COOLDOWN_SECONDS = 0.8     -- cooldown entre requisições por tipo por jogador
+local MAX_REQUESTS_PER_MINUTE = 120 -- limitação geral por minuto (opcional)
+
+-- Pasta para logs
+local logsFolder = ServerStorage:FindFirstChild("SecurityLogs")
+if not logsFolder then
+    logsFolder = Instance.new("Folder")
+    logsFolder.Name = "SecurityLogs"
+    logsFolder.Parent = ServerStorage
+end
+
+-- Cria/garante pasta de eventos
+local evFolder = ReplicatedStorage:FindFirstChild("DevAutoEvents")
+if not evFolder then
+    evFolder = Instance.new("Folder")
+    evFolder.Name = "DevAutoEvents"
+    evFolder.Parent = ReplicatedStorage
+end
+
+local function ensureEvent(name)
+    local ev = evFolder:FindFirstChild(name)
+    if not ev then
+        ev = Instance.new("RemoteEvent")
+        ev.Name = name
+        ev.Parent = evFolder
+    end
+    return ev
+end
+
+local KillAuraEvent = ensureEvent("KillAuraEvent")
+local AutoChopEvent = ensureEvent("AutoChopEvent")
+local CollectEvent = ensureEvent("CollectEvent")
+local ReviveEvent = ensureEvent("ReviveEvent")
+local UnlockChildrenEvent = ensureEvent("UnlockChildrenEvent")
+local BurnAllEvent = ensureEvent("BurnAllEvent")
+local ServerResponseEvent = ensureEvent("ServerResponseEvent") -- para feedback ao cliente
+
+-- Estado por jogador para limitar requests
+local playerState = {}
+
+local function now()
+    return os.time()
+end
+
+local function makeLog(player, action, details)
+    local entry = Instance.new("StringValue")
+    entry.Name = (player and player.Name or "Unknown").."_"..tostring(now())
+    entry.Value = string.format("[%s] Player=%s UserId=%s Action=%s Details=%s", os.date(), tostring(player and player.Name), tostring(player and (player.UserId or "nil")), action, tostring(details))
+    entry.Parent = logsFolder
+    print("[SECURITY_LOG] ", entry.Value)
+end
+
+-- Util helpers
+local function isModelMob(model)
+    if not model or not model:IsA("Model") then return false end
+    -- 1) CollectionService tag
+    if CollectionService:HasTag(model, "Mob") then return true end
+    -- 2) heurística: tem Humanoid
+    if model:FindFirstChildOfClass("Humanoid") then return true end
+    -- 3) PrimaryPart / HumanoidRootPart
+    if model:FindFirstChild("HumanoidRootPart") then return true end
+    return false
+end
+
+local function isPartTree(part)
+    if not part or not part:IsA("BasePart") then return false end
+    -- tag
+    if CollectionService:HasTag(part, "Tree") then return true end
+    -- attribute explicit
+    if part:GetAttribute("IsTree") == true then return true end
+    -- heurística: geralmente árvores são ancoradas e têm tamanho considerável
+    local sizeScore = (part.Size.X + part.Size.Y + part.Size.Z)
+    if part.Anchored and sizeScore > 10 then return true end
+    -- nomes com "tree"/"log"/"trunk"
+    local lname = string.lower(part.Name)
+    if string.find(lname, "tree") or string.find(lname, "log") or string.find(lname, "trunk") then return true end
+    return false
+end
+
+local function isPartItem(part)
+    if not part or not part:IsA("BasePart") then return false end
+    -- tag
+    if CollectionService:HasTag(part, "Item") then return true end
+    -- atributo explicit
+    if part:GetAttribute("IsCollectible") == true then return true end
+    -- heurística: tem ClickDetector/ProximityPrompt ou não está ancorado (pickup)
+    for _, c in ipairs(part:GetChildren()) do
+        if c:IsA("ClickDetector") or c:IsA("ProximityPrompt") then return true end
+    end
+    -- peças pequenas, não ancoradas
+    local sizeScore = (part.Size.X + part.Size.Y + part.Size.Z)
+    if not part.Anchored and sizeScore < 12 then return true end
+    -- nomes com "wood" "stone" "flower" "chest"
+    local lname = string.lower(part.Name)
+    if string.find(lname, "wood") or string.find(lname, "stone") or string.find(lname, "flower") or string.find(lname, "chest") then return true end
+    return false
+end
+
+local function isWithinDistance(pos1, pos2, maxDist)
+    if not pos1 or not pos2 then return false end
+    return (pos1 - pos2).Magnitude <= (maxDist or MAX_DISTANCE_DEFAULT)
+end
+
+local function checkCooldown(player, action)
+    playerState[player] = playerState[player] or {last = {}, count = 0, windowStart = now()}
+    local st = playerState[player]
+    local last = st.last[action]
+    if last and (now() - last) < COOLDOWN_SECONDS then
+        return false, "cooldown"
+    end
+    st.last[action] = now()
+    if now() - st.windowStart >= 60 then
+        st.count = 0
+        st.windowStart = now()
+    end
+    st.count = st.count + 1
+    if st.count > MAX_REQUESTS_PER_MINUTE then
+        return false, "rate_limit"
+    end
+    return true
+end
+
+local function hasToolEquipped(player, toolKeywords)
+    local char = player.Character
+    if not char then return false end
+    for _, child in ipairs(char:GetChildren()) do
+        if child:IsA("Tool") then
+            for _, kw in ipairs(toolKeywords) do
+                if string.find(string.lower(child.Name), string.lower(kw)) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- Busca entidades com as novas heurísticas
+local function findMobsNear(pos, radius)
+    local out = {}
+    for _, desc in ipairs(workspace:GetDescendants()) do
+        if desc:IsA("Model") and isModelMob(desc) then
+            local root = desc:FindFirstChild("HumanoidRootPart") or desc:FindFirstChildWhichIsA("BasePart")
+            if root and isWithinDistance(root.Position, pos, radius) then
+                table.insert(out, desc)
+            end
+        end
+    end
+    return out
+end
+
+local function findTreesNear(pos, radius)
+    local out = {}
+    for _, desc in ipairs(workspace:GetDescendants()) do
+        if desc:IsA("BasePart") and isPartTree(desc) then
+            if isWithinDistance(desc.Position, pos, radius) then table.insert(out, desc) end
+        end
+    end
+    return out
+end
+
+local function findItemsNear(pos, radius)
+    local out = {}
+    for _, desc in ipairs(workspace:GetDescendants()) do
+        if desc:IsA("BasePart") and isPartItem(desc) then
+            if isWithinDistance(desc.Position, pos, radius) then table.insert(out, desc) end
+        end
+    end
+    return out
+end
+
+-- Autoritativas (sem grandes mudanças)
+local function killMobServerSide(model, player)
+    if not model then return false end
+    local humanoid = model:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        humanoid.Health = 0
+        return true
+    else
+        pcall(function() model:BreakJoints() end)
+        return true
+    end
+end
+
+local function chopTreeServerSide(part, player)
+    if part and part.Parent then
+        pcall(function() part:Destroy() end)
+        return true
+    end
+    return false
+end
+
+local function collectItemServerSide(part, player)
+    if not part or not player then return false end
+    local ok, err = pcall(function()
+        if part.Parent then
+            local tool = Instance.new("Tool")
+            tool.Name = (part.Name or "Item").."_collected"
+            tool.Parent = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack")
+            part:Destroy()
+        end
+    end)
+    return ok
+end
+
+-- Handlers (mantidos, agora usam deteccao automática)
+KillAuraEvent.OnServerEvent:Connect(function(player, enabled, radius, clientPos)
+    makeLog(player, "KillAuraRequest", string.format("enabled=%s radius=%s pos=%s", tostring(enabled), tostring(radius), tostring(clientPos)))
+    local ok, why = checkCooldown(player, "KillAura")
+    if not ok then
+        ServerResponseEvent:FireClient(player, false, why)
+        return
+    end
+    if not enabled then
+        ServerResponseEvent:FireClient(player, true, "disabled")
+        return
+    end
+    local char = player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then
+        ServerResponseEvent:FireClient(player, false, "no_character")
+        return
+    end
+    local pos = char.HumanoidRootPart.Position
+    if clientPos and typeof(clientPos) == "Vector3" then
+        if not isWithinDistance(clientPos, pos, 6) then
+            ServerResponseEvent:FireClient(player, false, "client_pos_mismatch")
+            makeLog(player, "Suspicious", "client position far from server position")
+            return
+        end
+    end
+    if not hasToolEquipped(player, {"axe", "hatchet", "saw"}) then
+        ServerResponseEvent:FireClient(player, false, "no_tool_equipped")
+        makeLog(player, "Rejected", "KillAura without tool")
+        return
+    end
+    radius = tonumber(radius) or MAX_DISTANCE_DEFAULT
+    if radius > 700 then
+        ServerResponseEvent:FireClient(player, false, "radius_too_large")
+        makeLog(player, "Rejected", "KillAura radius too large: "..tostring(radius))
+        return
+    end
+    local mobs = findMobsNear(pos, radius)
+    local killed = 0
+    for _, m in ipairs(mobs) do
+        local s, r = pcall(killMobServerSide, m, player)
+        if s and r then killed = killed + 1 end
+    end
+    makeLog(player, "KillAuraExecuted", string.format("killed=%d radius=%s", killed, tostring(radius)))
+    ServerResponseEvent:FireClient(player, true, "killed:"..tostring(killed))
+end)
+
+AutoChopEvent.OnServerEvent:Connect(function(player, enabled, radius, clientPos)
+    makeLog(player, "AutoChopRequest", string.format("enabled=%s radius=%s pos=%s", tostring(enabled), tostring(radius), tostring(clientPos)))
+    local ok, why = checkCooldown(player, "AutoChop")
+    if not ok then
+        ServerResponseEvent:FireClient(player, false, why)
+        return
+    end
+    if not enabled then
+        ServerResponseEvent:FireClient(player, true, "disabled")
+        return
+    end
+    local char = player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then
+        ServerResponseEvent:FireClient(player, false, "no_character")
+        return
+    end
+    local pos = char.HumanoidRootPart.Position
+    if clientPos and typeof(clientPos) == "Vector3" and not isWithinDistance(clientPos, pos, 6) then
+        ServerResponseEvent:FireClient(player, false, "client_pos_mismatch")
+        makeLog(player, "Suspicious", "client position far from server position")
+        return
+    end
+    if not hasToolEquipped(player, {"axe", "hatchet"}) then
+        ServerResponseEvent:FireClient(player, false, "no_tool_equipped")
+        makeLog(player, "Rejected", "AutoChop without tool")
+        return
+    end
+    radius = tonumber(radius) or 40
+    if radius > 500 then
+        ServerResponseEvent:FireClient(player, false, "radius_too_large")
+        makeLog(player, "Rejected", "AutoChop radius too large")
+        return
+    end
+    local trees = findTreesNear(pos, radius)
+    local chopped = 0
+    for _, t in ipairs(trees) do
+        local s, r = pcall(chopTreeServerSide, t, player)
+        if s and r then chopped = chopped + 1 end
+    end
+    makeLog(player, "AutoChopExecuted", string.format("chopped=%d radius=%s", chopped, tostring(radius)))
+    ServerResponseEvent:FireClient(player, true, "chopped:"..tostring(chopped))
+end)
+
+CollectEvent.OnServerEvent:Connect(function(player, radius, clientPos)
+    makeLog(player, "CollectRequest", string.format("radius=%s pos=%s", tostring(radius), tostring(clientPos)))
+    local ok, why = checkCooldown(player, "Collect")
+    if not ok then ServerResponseEvent:FireClient(player, false, why); return end
+    local char = player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then ServerResponseEvent:FireClient(player, false, "no_character"); return end
+    local pos = char.HumanoidRootPart.Position
+    if clientPos and typeof(clientPos) == "Vector3" and not isWithinDistance(clientPos, pos, 6) then
+        ServerResponseEvent:FireClient(player, false, "client_pos_mismatch")
+        makeLog(player, "Suspicious", "client position far from server position")
+        return
+    end
+    radius = tonumber(radius) or 40
+    if radius > 300 then ServerResponseEvent:FireClient(player, false, "radius_too_large"); makeLog(player, "Rejected", "Collect radius too large"); return end
+    local items = findItemsNear(pos, radius)
+    local collected = 0
+    for _, it in ipairs(items) do
+        local s, r = pcall(collectItemServerSide, it, player)
+        if s and r then collected = collected + 1 end
+    end
+    makeLog(player, "CollectExecuted", string.format("collected=%d radius=%s", collected, tostring(radius)))
+    ServerResponseEvent:FireClient(player, true, "collected:"..tostring(collected))
+end)
+
+ReviveEvent.OnServerEvent:Connect(function(player)
+    makeLog(player, "ReviveRequest", "")
+    local ok, why = checkCooldown(player, "Revive")
+    if not ok then ServerResponseEvent:FireClient(player, false, why); return end
+    local char = player.Character
+    if char and char:FindFirstChildOfClass("Humanoid") then
+        local humanoid = char:FindFirstChildOfClass("Humanoid")
+        if humanoid.Health <= 0 then
+            humanoid.Health = humanoid.MaxHealth
+            local spawn = workspace:FindFirstChildWhichIsA("SpawnLocation")
+            if spawn then char:MoveTo(spawn.Position + Vector3.new(0,3,0)) end
+            makeLog(player, "Revived", "")
+            ServerResponseEvent:FireClient(player, true, "revived")
+            return
+        end
+    end
+    player:LoadCharacter()
+    makeLog(player, "Respawned", "")
+    ServerResponseEvent:FireClient(player, true, "respawned")
+end)
+
+UnlockChildrenEvent.OnServerEvent:Connect(function(player)
+    makeLog(player, "UnlockChildrenRequest", "")
+    local ok, why = checkCooldown(player, "UnlockChildren")
+    if not ok then ServerResponseEvent:FireClient(player, false, why); return end
+    local unlocked = 0
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") and string.find(string.lower(obj.Name), "child") then
+            pcall(function()
+                obj:SetAttribute("Locked", false)
+                unlocked = unlocked + 1
+            end)
+        end
+    end
+    makeLog(player, "UnlockChildrenExecuted", tostring(unlocked))
+    ServerResponseEvent:FireClient(player, true, "unlocked:"..tostring(unlocked))
+end)
+
+BurnAllEvent.OnServerEvent:Connect(function(player)
+    makeLog(player, "BurnAllRequest", "")
+    local ok, why = checkCooldown(player, "BurnAll")
+    if not ok then ServerResponseEvent:FireClient(player, false, why); return end
+    local char = player.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then ServerResponseEvent:FireClient(player, false, "no_character"); return end
+    local pos = char.HumanoidRootPart.Position
+    local items = findItemsNear(pos, 200)
+    local destroyed = 0
+    for _, it in ipairs(items) do
+        pcall(function() if it and it.Parent then it:Destroy(); destroyed = destroyed + 1 end end)
+    end
+    makeLog(player, "BurnAllExecuted", tostring(destroyed))
+    ServerResponseEvent:FireClient(player, true, "burned:"..tostring(destroyed))
+end)
+
+print("[ServerSecurity] Loaded and listening for DevAutoEvents. Logs -> ServerStorage.SecurityLogs")
+```
+
+````
+
+---
+
+## 2) ServerSimulator_MaliciousTester.lua
+
+```lua
+-- ServerSimulator_MaliciousTester.lua
+-- Colocar em ServerScriptService apenas durante testes
+-- Simula requests "maliciosos" diretamente server-side para testar validações
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local evFolder = ReplicatedStorage:WaitForChild("DevAutoEvents")
+local KillAuraEvent = evFolder:WaitForChild("KillAuraEvent")
+local AutoChopEvent = evFolder:WaitForChild("AutoChopEvent")
+local CollectEvent = evFolder:WaitForChild("CollectEvent")
+local ReviveEvent = evFolder:WaitForChild("ReviveEvent")
+local UnlockChildrenEvent = evFolder:WaitForChild("UnlockChildrenEvent")
+local BurnAllEvent = evFolder:WaitForChild("BurnAllEvent")
+
+-- Procura um jogador de teste (o primeiro conectado)
+local function getAnyPlayer()
+    for _, p in ipairs(Players:GetPlayers()) do return p end
+    return nil
+end
+
+-- Aguardar jogador
+local player
+Players.PlayerAdded:Connect(function(p) player = p end)
+player = getAnyPlayer()
+
+-- Se já houver jogador (Play Solo), utiliza ele
+if not player then player = getAnyPlayer() end
+
+-- Funções de simulação
+local function simulateKillAura(player)
+    print("[Simulator] Simulating KillAura (large radius)")
+    -- envia com radius absurdo e posição diferente
+    local fakePos = Vector3.new(99999, 99999, 99999)
+    KillAuraEvent:FireServer(player, true, 2000, fakePos) -- simula client enviando posição mentirosa
+end
+
+local function simulateAutoChopNoTool(player)
+    print("[Simulator] Simulating AutoChop without tool equipped")
+    AutoChopEvent:FireServer(player, true, 200)
+end
+
+local function simulateCollectLargeRadius(player)
+    print("[Simulator] Simulating Collect large radius")
+    CollectEvent:FireServer(player, 1000)
+end
+
+local function simulateSpam(player)
+    print("[Simulator] Simulating rapid spam requests")
+    for i=1, 20 do
+        KillAuraEvent:FireServer(player, true, 20)
+    end
+end
+
+-- Delay para garantir que tudo esteja pronto
+task.spawn(function()
+    task.wait(2)
+    local p = getAnyPlayer()
+    if not p then print("[Simulator] Nenhum jogador conectado ainda. Abortando simulação.") return end
+    simulateKillAura(p)
+    task.wait(1)
+    simulateAutoChopNoTool(p)
+    task.wait(1)
+    simulateCollectLargeRadius(p)
+    task.wait(1)
+    simulateSpam(p)
+end)
+
+print("[Simulator] Malicious simulator loaded (remove this script after tests)")
+````
+
+---
+
+## 3) ClientTestTool.lua (LocalScript)
+
+```lua
+-- ClientTestTool.lua
+-- Colocar em StarterPlayer > StarterPlayerScripts
+-- GUI simples para enviar pedidos válidos e inválidos e mostrar respostas do servidor
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+local evFolder = ReplicatedStorage:WaitForChild("DevAutoEvents")
+local KillAuraEvent = evFolder:WaitForChild("KillAuraEvent")
+local AutoChopEvent = evFolder:WaitForChild("AutoChopEvent")
+local CollectEvent = evFolder:WaitForChild("CollectEvent")
+local ReviveEvent = evFolder:WaitForChild("ReviveEvent")
+local UnlockChildrenEvent = evFolder:WaitForChild("UnlockChildrenEvent")
+local BurnAllEvent = evFolder:WaitForChild("BurnAllEvent")
+local ServerResponseEvent = evFolder:WaitForChild("ServerResponseEvent")
+
+-- GUI
+local screenGui = Instance.new("ScreenGui", PlayerGui)
+screenGui.Name = "ClientTestTool"
+
+local frame = Instance.new("Frame", screenGui)
+frame.Size = UDim2.new(0,300,0,260)
+frame.Position = UDim2.new(0,10,0.35, -130)
+frame.BackgroundColor3 = Color3.fromRGB(24,24,24)
+
+local function newButton(text, y)
+    local b = Instance.new("TextButton", frame)
+    b.Size = UDim2.new(1, -12, 0, 28)
+    b.Position = UDim2.new(0,6,0,y)
+    b.Text = text
+    b.TextScaled = true
+    b.BackgroundColor3 = Color3.fromRGB(48,48,48)
+    return b
+end
+
+local validKill = newButton("KillAura (valido)", 8)
+local invalidKill = newButton("KillAura (inv: fake pos)", 44)
+local validChop = newButton("AutoChop (valido)", 80)
+local invalidChop = newButton("AutoChop (inv: no tool)", 116)
+local collectBtn = newButton("Collect (valido)", 152)
+local collectBad = newButton("Collect (inv: large)", 188)
+local reviveBtn = newButton("Revive", 224)
+
+local statusLabel = Instance.new("TextLabel", frame)
+statusLabel.Size = UDim2.new(1, -12, 0, 36)
+statusLabel.Position = UDim2.new(0,6,0, 230)
+statusLabel.BackgroundTransparency = 1
+statusLabel.Text = "Status: idle"
+statusLabel.TextScaled = true
+
+-- Handler de resposta do servidor
+ServerResponseEvent.OnClientEvent:Connect(function(success, reason)
+    statusLabel.Text = "ServerResponse: "..tostring(success).." -> "..tostring(reason)
+end)
+
+validKill.MouseButton1Click:Connect(function()
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+    local pos = char.HumanoidRootPart.Position
+    KillAuraEvent:FireServer(true, 60, pos)
+end)
+
+invalidKill.MouseButton1Click:Connect(function()
+    -- envia posição falsa
+    local fakePos = Vector3.new(99999,99999,99999)
+    KillAuraEvent:FireServer(true, 500, fakePos)
+end)
+
+validChop.MouseButton1Click:Connect(function()
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+    local pos = char.HumanoidRootPart.Position
+    AutoChopEvent:FireServer(true, 40, pos)
+end)
+
+invalidChop.MouseButton1Click:Connect(function()
+    AutoChopEvent:FireServer(true, 200)
+end)
+
+collectBtn.MouseButton1Click:Connect(function()
+    local char = LocalPlayer.Character
+    if not char or not char:FindFirstChild("HumanoidRootPart") then return end
+    CollectEvent:FireServer(40, char.HumanoidRootPart.Position)
+end)
+
+collectBad.MouseButton1Click:Connect(function()
+    CollectEvent:FireServer(1000)
+end)
+
+reviveBtn.MouseButton1Click:Connect(function()
+    ReviveEvent:FireServer()
+end)
+
+print("[ClientTestTool] loaded - GUI available for testing.")
+```
+
+---
+
+### Observações finais e recomendações
+
+* **Remova o `ServerSimulator_MaliciousTester.lua`** quando terminar os testes.
+* Ajuste os *patterns* (arrays no topo do ServerScript) para corresponder exatamente aos nomes dos mobs/trees/itens do seu projeto — isso melhora a precisão.
+* Para segurança real em produção: valide também
+
+  * ownership (quem realmente pode pegar um item),
+  * checagem de stamina/recursos, e
+  * verificação server-side de vida/estado dos mobs para evitar duplicação de XP.
+
+Se quiser, eu já adapto os *patterns* (MOB_NAME_PATTERNS, TREE_NAME_PATTERNS, ITEM_NAME_PATTERNS) para os nomes que você tem no Explorer — ou gero uma variação que usa `CollectionService` tags em vez de nomes (recomendado). Basta enviar os nomes ou dizer se prefere usar tags do CollectionService.
+
+---
+
+*Pronto — os três scripts estão aqui no documento. Use em ambiente controlado e me diga se quer que eu converta a detecção por nome para detecção por `CollectionService` tags (mais robusta).*
